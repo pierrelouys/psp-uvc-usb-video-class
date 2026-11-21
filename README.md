@@ -34,8 +34,10 @@ is logged with its error code; nothing is retried or worked around silently.
 
 **Stopping**
 
-There is no button combination. The plugin shuts its USB driver down in
-`module_stop` when the system unloads it (for example when the game exits).
+There is no button combination. The plugin shuts its USB driver down when the
+system unloads it (`module_stop`) and when the system reboots, which is what
+happens when a game exits via HOME -> Exit Game (`module_reboot_before`).
+Both log `... entered` and `... done` lines.
 
 **Viewing**
 

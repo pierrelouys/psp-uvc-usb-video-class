@@ -17,6 +17,7 @@
 #define LOG_FLUSH_PERIOD_US	(100 * 1000)
 #define LOG_STOP_TIMEOUT_US	(500 * 1000)
 #define LOG_PATH_MAX		256
+#define LOG_DRAIN_WAIT_US	(300 * 1000)
 static char log_path[LOG_PATH_MAX];
 static char ring[LOG_RING_SIZE];
 static volatile unsigned int ring_head;	/* next write position (producers) */
@@ -215,11 +216,15 @@ static int ring_drain_unlocked(void)
 
 static int ring_drain(void)
 {
+	SceUInt timeout;
 	int ret;
 
 	if (drain_sema < 0)
 		return ring_drain_unlocked();
-	ret = sceKernelWaitSema(drain_sema, 1, NULL);
+	/* Bounded: a writer thread stuck in Memory Stick I/O must not be able to
+	 * block module_stop / module_reboot_before. */
+	timeout = LOG_DRAIN_WAIT_US;
+	ret = sceKernelWaitSema(drain_sema, 1, &timeout);
 	if (ret < 0)
 		return ret;
 	ret = ring_drain_unlocked();

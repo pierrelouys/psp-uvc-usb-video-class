@@ -45,6 +45,7 @@ void __libcglue_deinit(void)
 #define FRAME_SEND_TIMEOUT_US		1000000
 #define FRAME_CANCEL_TIMEOUT_US		200000
 #define MODULE_STOP_TIMEOUT_US		1000000
+#define REBOOT_STOP_TIMEOUT_US		500000
 #define STATS_PERIOD_US			5000000
 
 #define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_YUY2(480, 272)
@@ -625,6 +626,14 @@ static int convert_and_send_frame_yuy2(int fid, void *fbaddr, int fbstride, int 
 		t1 = sceKernelGetSystemTimeLow();
 		*csc_us += t1 - t0;
 
+		/* Shutdown (module_stop / module_reboot_before) may start at any moment:
+		 * never queue another request once it has. */
+		if (!run) {
+			if (in_flight)
+				uvc_wait_chunk_sent();
+			return UVC_ERR_STOPPED;
+		}
+
 		/* The previous chunk was on the wire while this one was converted. */
 		if (in_flight) {
 			ret = uvc_wait_chunk_sent();
@@ -929,22 +938,25 @@ int main(int argc, char *argv[])
 }
 
 /*
- * Called by the system when the plugin is unloaded, e.g. when the XMB is torn
- * down to start a game. It must never block the system or fail: the main
- * thread is usually parked in sceDisplayWaitVblankStart(), which does not
- * return while the display is being shut down, so it is explicitly released
- * instead of waited on, and killed if it still does not finish in time.
+ * Shared by module_stop() and module_reboot_before(). Must never block the
+ * system for long or fail: the main thread is usually parked in
+ * sceDisplayWaitVblankStart(), which does not return while the display is
+ * being shut down, so it is explicitly released instead of waited on, and
+ * killed if it still does not finish in time.
  */
-int module_stop(SceSize args, void *argp)
+static void uvc_shutdown(const char *who, SceUInt wait_us)
 {
-	SceUInt timeout = MODULE_STOP_TIMEOUT_US;
+	SceUInt timeout = wait_us;
 	SceUID thid = main_thid;
 	int ret;
 
-	LOG("module_stop entered\n");
+	/* Flushed at once, while the Memory Stick is certainly still usable, so
+	 * the log always shows that the hook ran even if a later step hangs. */
+	LOG("%s entered\n", who);
 	log_flush();
 
 	run = 0;
+	stream = 0;
 	if (uvc_frame_req_evflag >= 0)
 		sceKernelSetEventFlag(uvc_frame_req_evflag, EVENT_STOP_STREAM);
 
@@ -952,20 +964,46 @@ int module_stop(SceSize args, void *argp)
 		sceKernelReleaseWaitThread(thid);
 		ret = sceKernelWaitThreadEnd(thid, &timeout);
 		if (ret < 0 && main_thid >= 0) {
-			LOG("module_stop: main thread did not finish (0x%08X); terminating it\n", ret);
+			LOG("%s: main thread did not finish (0x%08X); terminating it\n", who, ret);
 			sceKernelTerminateThread(thid);
 		}
 	}
 
 	/*
 	 * The USB bus driver keeps pointers into this module (usb_driver,
-	 * descriptors, endpoints). If the module memory is freed while the driver
-	 * is still registered or active, the next USB event crashes the system.
-	 * No-op when the main thread already unwound everything.
+	 * descriptors, endpoints) and DMAs from the TX buffers. If either goes
+	 * away while the driver is still registered or active, the next USB event
+	 * crashes the system. No-op when the main thread already unwound
+	 * everything.
 	 */
 	uvc_teardown(&uvc_st);
-	LOG("module_stop done\n");
+	LOG("%s done\n", who);
 	log_flush();
+}
 
+/*
+ * Called by the system when the plugin is unloaded.
+ */
+int module_stop(SceSize args, void *argp)
+{
+	uvc_shutdown("module_stop", MODULE_STOP_TIMEOUT_US);
+	return 0;
+}
+
+/*
+ * Called by loadexec on every module right before the system reboots, which is
+ * what happens when a game exits (HOME -> Exit Game). The kernel does not
+ * unload kernel-mode plugins on that path, so module_stop() never runs there;
+ * without this hook the streaming thread keeps sending USB requests and
+ * reading the display while the USB bus driver, the display and memory are
+ * torn down underneath it, and the system crashes.
+ */
+int module_reboot_before(void *arg1, int arg2, int arg3, int arg4)
+{
+	(void)arg1;
+	(void)arg2;
+	(void)arg3;
+	(void)arg4;
+	uvc_shutdown("module_reboot_before", REBOOT_STOP_TIMEOUT_US);
 	return 0;
 }
