@@ -1,29 +1,51 @@
+#include <stdint.h>
 #include <string.h>
 #include <pspkernel.h>
-#include <pspdebug.h>
 #include <pspdisplay.h>
-#include <pspctrl.h>
 #include "pspdmacplus.h"
 #include "usb.h"
 #include "usb_descriptors.h"
-#include "utils.h"
 #include "format_conversion.h"
-
-#define ENABLE_LOGGING 1
-
-#if ENABLE_LOGGING == 1
-#define LOG(...) printf(__VA_ARGS__)
-#else
-#define LOG(...) (void)0
-#endif
+#include "log.h"
 
 PSP_MODULE_INFO("UVC", PSP_MODULE_KERNEL, 1, 1);
 PSP_MAIN_THREAD_ATTR(0);
+/*
+ * This module runs inside whatever process loads it (the XMB or a game). The
+ * newlib default is to claim almost all free user memory on the first malloc,
+ * which is harmless in the XMB but starves a game. Bound both the heap and the
+ * main thread stack to what this plugin actually needs.
+ */
+PSP_HEAP_SIZE_KB(0);
+PSP_MAIN_THREAD_STACK_SIZE_KB(16);
 
 #define USB_DRIVERNAME "UVC"
 #define USB_PRODUCT_ID 0x1337
 
-#define EXIT_MASK (PSP_CTRL_START | PSP_CTRL_RTRIGGER)
+/*
+ * Replaces the SDK's libc init (weak symbol, meant to be overridden). The
+ * default also sets up pthread, stdio descriptors, cwd and timezone before
+ * main() in whatever process loads the plugin. The plugin uses none of that:
+ * no stdio, no malloc, no locks (its log has its own formatter).
+ */
+void __libcglue_init(int argc, char *argv[])
+{
+	(void)argc;
+	(void)argv;
+}
+
+void __libcglue_deinit(void)
+{
+}
+
+/* Sony's USB bus driver reports this when the requested state already holds
+ * (pspusb.h: PSP_USB_ERROR_ALREADY_DONE). */
+#define UVC_USB_ERROR_ALREADY_DONE	0x80243001
+
+#define FRAME_SEND_TIMEOUT_US		1000000
+#define FRAME_CANCEL_TIMEOUT_US		200000
+#define MODULE_STOP_TIMEOUT_US		1000000
+#define STATS_PERIOD_US			5000000
 
 #define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_YUY2(480, 272)
 
@@ -65,12 +87,85 @@ static struct {
 	struct DeviceRequest ep0_req;
 } __attribute__((aligned(64))) pending_recv;
 
-//static SceUID uvc_thread_id;
-//static SceUID uvc_event_flag_id;
-//static int uvc_thread_run;
-static int stream;
-static SceUID uvc_frame_req_evflag;
-static unsigned char tx_buf[MAX_UVC_PAYLOAD_TRANSFER_SIZE] __attribute__((aligned(64)));
+static volatile int run = 1;
+static volatile int stream;
+static volatile SceUID main_thid = -1;
+static SceUID uvc_frame_req_evflag = -1;
+static volatile int frame_req_return_code;
+static volatile int frame_req_transmitted;
+/*
+ * A frame is sent as UVC_FRAME_CHUNKS payload transfers of UVC_CHUNK_ROWS rows
+ * each, converted into one of two small buffers while the other is on the
+ * wire. A whole-frame buffer is 261 KB: too big for the kernel partition in
+ * game mode, and if it is placed in the game's own (user) memory it is freed
+ * under the USB driver when the game exits.
+ */
+#define UVC_FRAME_W		480
+#define UVC_FRAME_H		272
+#define UVC_CHUNK_ROWS		16
+#define UVC_FRAME_CHUNKS	(UVC_FRAME_H / UVC_CHUNK_ROWS)
+#define UVC_CHUNK_DATA_SIZE	(UVC_CHUNK_ROWS * UVC_FRAME_W * 2)
+#define UVC_CHUNK_SIZE		(UVC_PAYLOAD_HEADER_SIZE + UVC_CHUNK_DATA_SIZE)
+#define TX_BUF_COUNT		2
+#define TX_BUF_ALIGN		64
+#define TX_BUF_STRIDE		(((UVC_CHUNK_SIZE) + TX_BUF_ALIGN - 1) & ~(TX_BUF_ALIGN - 1))
+#define TX_BLOCK_SIZE		(TX_BUF_COUNT * TX_BUF_STRIDE + TX_BUF_ALIGN)
+
+_Static_assert(UVC_FRAME_H % UVC_CHUNK_ROWS == 0, "chunks must cover the frame exactly");
+
+static SceUID tx_buf_blk = -1;
+static unsigned char *tx_buf[TX_BUF_COUNT];
+
+/* User-partition figures only: documented user API, no kernel internals. */
+static void log_user_memory(void)
+{
+	LOG("user partition: free %u, largest block %u\n",
+	    (unsigned int)sceKernelTotalFreeMemSize(), (unsigned int)sceKernelMaxFreeMemSize());
+}
+
+static int tx_buf_alloc(void)
+{
+	static const int partitions[] = { PSP_MEMORY_PARTITION_KERNEL, PSP_MEMORY_PARTITION_USER };
+	static const char *const names[] = { "kernel", "user (top)" };
+	/* User memory is the game's: take it from the top so the bottom, where
+	 * fixed-address homebrew loads, stays free. */
+	static const int types[] = { PSP_SMEM_Low, PSP_SMEM_High };
+	unsigned int i;
+
+	for (i = 0; i < sizeof(partitions) / sizeof(partitions[0]); i++) {
+		SceUID blk = sceKernelAllocPartitionMemory(partitions[i], "uvc_tx", types[i],
+							   TX_BLOCK_SIZE, NULL);
+		unsigned char *base;
+		int n;
+
+		if (blk < 0) {
+			LOG("tx buffer alloc (%s partition, %u bytes) failed: 0x%08X\n",
+			    names[i], (unsigned int)TX_BLOCK_SIZE, blk);
+			continue;
+		}
+		tx_buf_blk = blk;
+		base = (unsigned char *)(((uintptr_t)sceKernelGetBlockHeadAddr(blk) +
+					  TX_BUF_ALIGN - 1) & ~(uintptr_t)(TX_BUF_ALIGN - 1));
+		memset(base, 0, TX_BUF_COUNT * TX_BUF_STRIDE);
+		for (n = 0; n < TX_BUF_COUNT; n++)
+			tx_buf[n] = base + n * TX_BUF_STRIDE;
+		LOG("tx buffers: %d x %u bytes at %p (%s partition)\n", TX_BUF_COUNT,
+		    (unsigned int)UVC_CHUNK_SIZE, base, names[i]);
+		return 0;
+	}
+	return -1;
+}
+
+static void tx_buf_free(void)
+{
+	int n;
+
+	if (tx_buf_blk >= 0)
+		sceKernelFreePartitionMemory(tx_buf_blk);
+	tx_buf_blk = -1;
+	for (n = 0; n < TX_BUF_COUNT; n++)
+		tx_buf[n] = NULL;
+}
 
 static int usb_ep0_req_send(const void *data, unsigned int size)
 {
@@ -89,9 +184,14 @@ static int usb_ep0_req_send(const void *data, unsigned int size)
 		.physicalAddress = NULL
 	};
 
+	int ret;
+
 	sceKernelDcacheWritebackRange(data, size);
 
-	return sceUsbbdReqSend(&req);
+	ret = sceUsbbdReqSend(&req);
+	if (ret < 0)
+		LOG("EP0 send of %u bytes failed: 0x%08X\n", size, ret);
+	return ret;
 }
 
 static void usb_ep0_req_recv_on_complete(struct UsbbdDeviceRequest *req);
@@ -115,9 +215,14 @@ static int usb_ep0_enqueue_recv_for_req(const struct DeviceRequest *ep0_req)
 		.physicalAddress = NULL
 	};
 
+	int ret;
+
 	sceKernelDcacheInvalidateRange(pending_recv.buffer, pending_recv.ep0_req.wLength);
 
-	return sceUsbbdReqRecv(&req);
+	ret = sceUsbbdReqRecv(&req);
+	if (ret < 0)
+		LOG("EP0 recv of %u bytes failed: 0x%08X\n", pending_recv.ep0_req.wLength, ret);
+	return ret;
 }
 
 static int uvc_frame_req_init(void)
@@ -132,7 +237,10 @@ static int uvc_frame_req_init(void)
 
 static int uvc_frame_req_fini(void)
 {
-	return sceKernelDeleteEventFlag(uvc_frame_req_evflag);
+	SceUID id = uvc_frame_req_evflag;
+
+	uvc_frame_req_evflag = -1;
+	return sceKernelDeleteEventFlag(id);
 }
 
 static void uvc_handle_video_streaming_req_recv(const struct DeviceRequest *req)
@@ -412,206 +520,452 @@ static struct UsbDriver usb_driver = {
 
 static void uvc_frame_send_req_on_complete(struct UsbbdDeviceRequest *req)
 {
+	frame_req_return_code = req->returnCode;
+	frame_req_transmitted = req->transmitted;
 	sceKernelSetEventFlag(uvc_frame_req_evflag, EVENT_FRAME_SENT);
 }
 
-int convert_and_send_frame_yuy2(int fid, void *fbaddr, int fbstride, int fbpixelformat)
+/* Errors reported by the frame path that are not SCE error codes. */
+#define UVC_ERR_LCDC_FORMAT_UNKNOWN	((int)0x80000001)
+#define UVC_ERR_FRAME_SHORT		((int)0x80000002)
+#define UVC_ERR_PIXEL_FORMAT_UNKNOWN	((int)0x80000003)
+#define UVC_ERR_STOPPED			((int)0x80000004)
+
+/* Returns 0 when the chunk was sent, 1 if the stream was aborted, < 0 on error. */
+static int uvc_wait_chunk_sent(void)
 {
-	static struct UsbbdDeviceRequest req;
-	static const int eof = 1;
-	unsigned int event;
-	unsigned int t0, t1, t2, t3;
+	u32 event = 0;
+	SceUInt timeout = FRAME_SEND_TIMEOUT_US;
 	int ret;
 
-	req = (struct UsbbdDeviceRequest){
-		.endpoint = &endpoints[1],
-		.data = tx_buf,
-		.size = sizeof(tx_buf),
-		.isControlRequest = 0,
-		.onComplete = uvc_frame_send_req_on_complete,
-		.transmitted = 0,
-		.returnCode = 0,
-		.next = NULL,
-		.unused = NULL,
-		.physicalAddress = NULL
-	};
+	ret = sceKernelWaitEventFlagCB(uvc_frame_req_evflag, EVENT_STOP_STREAM | EVENT_FRAME_SENT,
+				       PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &event, &timeout);
 
-	tx_buf[0] = UVC_PAYLOAD_HEADER_SIZE;
-	tx_buf[1] = UVC_STREAM_EOH;
-	if (fid)
-		tx_buf[1] |= UVC_STREAM_FID;
-	if (eof)
-		tx_buf[1] |= UVC_STREAM_EOF;
+	if (ret < 0 || (event & EVENT_STOP_STREAM)) {
+		/*
+		 * The request is still queued (host not reading, or we are being
+		 * stopped). The buffer and request must not be reused until the bus
+		 * driver is done with them, so cancel and wait for the completion.
+		 */
+		u32 cancel_event = 0;
+		SceUInt cancel_timeout = FRAME_CANCEL_TIMEOUT_US;
+		int cancel_ret;
 
-	t0 = sceKernelGetSystemTimeLow();
+		sceUsbbdReqCancelAll(&endpoints[1]);
+		cancel_ret = sceKernelWaitEventFlag(uvc_frame_req_evflag, EVENT_FRAME_SENT,
+						    PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR,
+						    &cancel_event, &cancel_timeout);
+		if (cancel_ret < 0)
+			LOG("Cancelled frame request never completed: 0x%08X\n", cancel_ret);
+		return ret < 0 ? ret : UVC_ERR_STOPPED;
+	}
 
-	if (fbpixelformat == PSP_DISPLAY_PIXEL_FORMAT_8888)
-		r8g8b8a8_to_yuy2(fbaddr, &tx_buf[UVC_PAYLOAD_HEADER_SIZE], fbstride, 480, 272);
-	else if (fbpixelformat == PSP_DISPLAY_PIXEL_FORMAT_565)
-		r5g6b5_to_yuy2(fbaddr, &tx_buf[UVC_PAYLOAD_HEADER_SIZE], fbstride, 480, 272);
-	else if (fbpixelformat == PSP_DISPLAY_PIXEL_FORMAT_5551)
-		r5g5b5a1_to_yuy2(fbaddr, &tx_buf[UVC_PAYLOAD_HEADER_SIZE], fbstride, 480, 272);
-	else if (fbpixelformat == PSP_DISPLAY_PIXEL_FORMAT_4444)
-		r4g4b4a4_to_yuy2(fbaddr, &tx_buf[UVC_PAYLOAD_HEADER_SIZE], fbstride, 480, 272);
+	if (frame_req_return_code == -3) /* cancelled by uvc_handle_video_abort() */
+		return 1;
+	if (frame_req_return_code != 0)
+		return frame_req_return_code;
+	if (frame_req_transmitted != (int)UVC_CHUNK_SIZE)
+		return UVC_ERR_FRAME_SHORT;
 
-	sceKernelDcacheWritebackRange(tx_buf, sizeof(tx_buf));
+	return 0;
+}
 
-	t1 = sceKernelGetSystemTimeLow();
+static int convert_and_send_frame_yuy2(int fid, void *fbaddr, int fbstride, int fbpixelformat,
+				       unsigned int *csc_us, unsigned int *send_us)
+{
+	static struct UsbbdDeviceRequest req[TX_BUF_COUNT];
+	int bytes_per_pixel;
+	int in_flight = 0;
+	int chunk;
+	int ret;
 
-	LOG("Sending frame...\n");
+	switch (fbpixelformat) {
+	case PSP_DISPLAY_PIXEL_FORMAT_8888:
+		bytes_per_pixel = 4;
+		break;
+	case PSP_DISPLAY_PIXEL_FORMAT_565:
+	case PSP_DISPLAY_PIXEL_FORMAT_5551:
+	case PSP_DISPLAY_PIXEL_FORMAT_4444:
+		bytes_per_pixel = 2;
+		break;
+	default:
+		return UVC_ERR_PIXEL_FORMAT_UNKNOWN;
+	}
 
-	t2 = sceKernelGetSystemTimeLow();
+	for (chunk = 0; chunk < UVC_FRAME_CHUNKS; chunk++) {
+		unsigned char *buf = tx_buf[chunk % TX_BUF_COUNT];
+		const unsigned char *src = (const unsigned char *)fbaddr +
+			(size_t)chunk * UVC_CHUNK_ROWS * fbstride * bytes_per_pixel;
+		unsigned char *dst = &buf[UVC_PAYLOAD_HEADER_SIZE];
+		unsigned int t0, t1;
 
-	ret = sceUsbbdReqSend(&req);
+		buf[0] = UVC_PAYLOAD_HEADER_SIZE;
+		buf[1] = UVC_STREAM_EOH;
+		if (fid)
+			buf[1] |= UVC_STREAM_FID;
+		if (chunk == UVC_FRAME_CHUNKS - 1)
+			buf[1] |= UVC_STREAM_EOF;
+
+		t0 = sceKernelGetSystemTimeLow();
+		switch (fbpixelformat) {
+		case PSP_DISPLAY_PIXEL_FORMAT_8888:
+			r8g8b8a8_to_yuy2(src, dst, fbstride, UVC_FRAME_W, UVC_CHUNK_ROWS);
+			break;
+		case PSP_DISPLAY_PIXEL_FORMAT_565:
+			r5g6b5_to_yuy2(src, dst, fbstride, UVC_FRAME_W, UVC_CHUNK_ROWS);
+			break;
+		case PSP_DISPLAY_PIXEL_FORMAT_5551:
+			r5g5b5a1_to_yuy2(src, dst, fbstride, UVC_FRAME_W, UVC_CHUNK_ROWS);
+			break;
+		default:
+			r4g4b4a4_to_yuy2(src, dst, fbstride, UVC_FRAME_W, UVC_CHUNK_ROWS);
+			break;
+		}
+		sceKernelDcacheWritebackRange(buf, UVC_CHUNK_SIZE);
+		t1 = sceKernelGetSystemTimeLow();
+		*csc_us += t1 - t0;
+
+		/* The previous chunk was on the wire while this one was converted. */
+		if (in_flight) {
+			ret = uvc_wait_chunk_sent();
+			*send_us += sceKernelGetSystemTimeLow() - t1;
+			in_flight = 0;
+			if (ret != 0)
+				return ret < 0 ? ret : 0;
+		}
+
+		req[chunk % TX_BUF_COUNT] = (struct UsbbdDeviceRequest){
+			.endpoint = &endpoints[1],
+			.data = buf,
+			.size = UVC_CHUNK_SIZE,
+			.isControlRequest = 0,
+			.onComplete = uvc_frame_send_req_on_complete,
+			.transmitted = 0,
+			.returnCode = 0,
+			.next = NULL,
+			.unused = NULL,
+			.physicalAddress = NULL
+		};
+		ret = sceUsbbdReqSend(&req[chunk % TX_BUF_COUNT]);
+		if (ret < 0)
+			return ret;
+		in_flight = 1;
+	}
+
+	{
+		unsigned int t = sceKernelGetSystemTimeLow();
+
+		ret = uvc_wait_chunk_sent();
+		*send_us += sceKernelGetSystemTimeLow() - t;
+	}
+	return ret < 0 ? ret : 0;
+}
+
+static int get_display_params_lcdc(void **addr, int *pixelformat, int *width, int *stride)
+{
+	int lcdc_pixelfmt = -1;
+	int ret;
+
+	ret = sceDmacplusLcdcGetFormat(width, stride, &lcdc_pixelfmt);
 	if (ret < 0)
 		return ret;
 
-	ret = sceKernelWaitEventFlagCB(uvc_frame_req_evflag, EVENT_STOP_STREAM | EVENT_FRAME_SENT,
-	                               PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &event, NULL);
-
-	t3 = sceKernelGetSystemTimeLow();
-
-	if (event & EVENT_STOP_STREAM)
-		LOG("Received stream stop!\n");
-	else if (event & EVENT_FRAME_SENT)
-		LOG("Frame sent!\n");
-
-	LOG("CSC: %dus, USB send: %dus\n", t1 - t0, t3 - t2);
-
-	return ret;
-}
-
-static void get_display_params_lcdc(void **addr, int *pixelformat, int *width, int *stride)
-{
-	int ldcd_pixelfmt;
-
 	*addr = (void *)((uintptr_t)sceDmacplusLcdcGetBaseAddr() & ~0x40000000);
-	sceDmacplusLcdcGetFormat(width, stride, &ldcd_pixelfmt);
 
-	if (ldcd_pixelfmt == SCE_DMACPLUS_LCDC_FORMAT_RGBA8888)
+	switch (lcdc_pixelfmt) {
+	case SCE_DMACPLUS_LCDC_FORMAT_RGBA8888:
 		*pixelformat = PSP_DISPLAY_PIXEL_FORMAT_8888;
-	else if (ldcd_pixelfmt == SCE_DMACPLUS_LCDC_FORMAT_RGB565)
+		break;
+	case SCE_DMACPLUS_LCDC_FORMAT_RGB565:
 		*pixelformat = PSP_DISPLAY_PIXEL_FORMAT_565;
-	else if (ldcd_pixelfmt == SCE_DMACPLUS_LCDC_FORMAT_RGBA5551)
+		break;
+	case SCE_DMACPLUS_LCDC_FORMAT_RGBA5551:
 		*pixelformat = PSP_DISPLAY_PIXEL_FORMAT_5551;
-	else if (ldcd_pixelfmt == SCE_DMACPLUS_LCDC_FORMAT_RGBA4444)
+		break;
+	case SCE_DMACPLUS_LCDC_FORMAT_RGBA4444:
 		*pixelformat = PSP_DISPLAY_PIXEL_FORMAT_4444;
+		break;
+	default:
+		LOG("Unknown LCDC pixel format %d (addr %p, w %d, stride %d)\n",
+		    lcdc_pixelfmt, *addr, *width, *stride);
+		return UVC_ERR_LCDC_FORMAT_UNKNOWN;
+	}
+
+	return 0;
 }
 
-static int send_frame(void)
+struct stream_stats {
+	unsigned int frames;
+	unsigned int errors;
+	unsigned int csc_us_total;
+	unsigned int send_us_total;
+};
+
+static int send_frame(struct stream_stats *stats)
 {
 	static int fid = 0;
+	static int last_w = -1, last_stride = -1, last_fmt = -1;
 
 	int ret;
-	void *fbaddr;
-	int fbwidth;
-	int fbstride;
+	void *fbaddr = NULL;
+	int fbwidth = 0;
+	int fbstride = 0;
 	int fbpixelformat = 0;
+	unsigned int csc_us = 0, send_us = 0;
 
-	//fbwidth = 480;
-	//ret = sceDisplayGetFrameBuf(&fbaddr, &fbstride, &fbpixelformat, PSP_DISPLAY_SETBUF_IMMEDIATE);
-	//if (ret < 0)
-	//	return ret;
+	ret = get_display_params_lcdc(&fbaddr, &fbpixelformat, &fbwidth, &fbstride);
+	if (ret < 0)
+		return ret;
 
-	get_display_params_lcdc(&fbaddr, &fbpixelformat, &fbwidth, &fbstride);
-
-	LOG("FB addr: %p, w: %d, stride: %d, pxlfmt: %d\n", fbaddr, fbwidth, fbstride, fbpixelformat);
+	/* The scanout address flips between the game's two buffers every frame;
+	 * only a change of geometry or format is worth a log line. */
+	if (fbwidth != last_w || fbstride != last_stride || fbpixelformat != last_fmt) {
+		LOG("Display mode: addr %p, w %d, stride %d, pixel format %d\n",
+		    fbaddr, fbwidth, fbstride, fbpixelformat);
+		last_w = fbwidth;
+		last_stride = fbstride;
+		last_fmt = fbpixelformat;
+	}
 
 	switch (uvc_probe_control_setting.bFormatIndex) {
-	case FORMAT_INDEX_UNCOMPRESSED_YUY2: {
-		//const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
-		//	video_streaming_descriptors.frames_uncompressed_yuy2;
-		//int dst_width = frames[uvc_probe_control_setting.bFrameIndex - 1].wWidth;
-		//int dst_height = frames[uvc_probe_control_setting.bFrameIndex - 1].wHeight;
-
-		ret = convert_and_send_frame_yuy2(fid, fbaddr, fbstride, fbpixelformat);
-		if (ret < 0) {
-			LOG("Error sending YUY2 frame: 0x%08X\n", ret);
-			return ret;
-		}
-
+	case FORMAT_INDEX_UNCOMPRESSED_YUY2:
+		ret = convert_and_send_frame_yuy2(fid, fbaddr, fbstride, fbpixelformat,
+						  &csc_us, &send_us);
 		break;
-	}
+	default:
+		LOG("Unsupported negotiated format index %d\n",
+		    uvc_probe_control_setting.bFormatIndex);
+		return -1;
 	}
 
+	if (ret < 0)
+		return ret;
+
+	stats->frames++;
+	stats->csc_us_total += csc_us;
+	stats->send_us_total += send_us;
+	fid ^= 1;
+
+	return 0;
+}
+
+/* Everything main() brought up, so a failure at any step unwinds exactly that. */
+struct uvc_state {
+	int driver_registered;
+	int bus_started_by_us;
+	int driver_started;
+	int activated;
+	int evflag_created;
+	int tx_buf_allocated;
+};
+
+/* Shared with module_stop(), which must be able to unwind the USB driver
+ * itself if the main thread cannot. */
+static struct uvc_state uvc_st;
+
+static void uvc_teardown(struct uvc_state *st)
+{
+	int ret;
+
+	uvc_handle_video_abort();
+
+	if (st->activated) {
+		ret = sceUsbDeactivate();
+		LOG("sceUsbDeactivate: 0x%08X\n", ret);
+	}
+	if (st->driver_started) {
+		ret = sceUsbStop(USB_DRIVERNAME, 0, 0);
+		LOG("sceUsbStop(" USB_DRIVERNAME "): 0x%08X\n", ret);
+	}
+	if (st->bus_started_by_us) {
+		ret = sceUsbStop(PSP_USB_BUS_DRIVERNAME, 0, 0);
+		LOG("sceUsbStop(" PSP_USB_BUS_DRIVERNAME "): 0x%08X\n", ret);
+	}
+	if (st->driver_registered) {
+		ret = sceUsbbdUnregister(&usb_driver);
+		LOG("sceUsbbdUnregister: 0x%08X\n", ret);
+	}
+	if (st->tx_buf_allocated)
+		tx_buf_free();
+	if (st->evflag_created) {
+		ret = uvc_frame_req_fini();
+		LOG("event flag delete: 0x%08X\n", ret);
+	}
+	memset(st, 0, sizeof(*st));
+}
+
+static int uvc_run(struct uvc_state *st)
+{
+	struct stream_stats stats = {0};
+	unsigned int stats_t0;
+	int last_usb_state = -1;
+	int last_frame_err = 0;
+	unsigned int suppressed_frame_errs = 0;
+	int ret;
+
+	ret = uvc_frame_req_init();
 	if (ret < 0) {
-		stream = 0;
+		LOG("Error creating frame event flag: 0x%08X\n", ret);
 		return ret;
 	}
+	st->evflag_created = 1;
 
-	fid ^= 1;
+	log_user_memory();
+	ret = tx_buf_alloc();
+	if (ret < 0)
+		return ret;
+	st->tx_buf_allocated = 1;
+
+	ret = sceUsbbdRegister(&usb_driver);
+	LOG("sceUsbbdRegister: 0x%08X\n", ret);
+	if (ret < 0)
+		return ret;
+	st->driver_registered = 1;
+
+	ret = sceUsbStart(PSP_USB_BUS_DRIVERNAME, 0, 0);
+	LOG("sceUsbStart(" PSP_USB_BUS_DRIVERNAME "): 0x%08X\n", ret);
+	if (ret == 0) {
+		st->bus_started_by_us = 1;
+	} else if ((unsigned int)ret != UVC_USB_ERROR_ALREADY_DONE) {
+		return ret;
+	} else {
+		LOG("USB bus driver was already started by the system; leaving it running on exit\n");
+	}
+
+	ret = sceUsbStart(USB_DRIVERNAME, 0, 0);
+	LOG("sceUsbStart(" USB_DRIVERNAME "): 0x%08X\n", ret);
+	if (ret < 0)
+		return ret;
+	st->driver_started = 1;
+
+	/* Current streaming settings start out as the defaults. */
+	memcpy(&uvc_probe_control_setting, &uvc_probe_control_setting_default,
+	       sizeof(uvc_probe_control_setting));
+	stream = 0;
+
+	ret = sceUsbActivate(USB_PRODUCT_ID);
+	LOG("sceUsbActivate(0x%04X): 0x%08X\n", USB_PRODUCT_ID, ret);
+	if (ret < 0)
+		return ret;
+	st->activated = 1;
+
+	stats_t0 = sceKernelGetSystemTimeLow();
+
+	while (run) {
+		int usb_state;
+
+		sceDisplayWaitVblankStart();
+		if (!run)
+			break;
+
+		usb_state = sceUsbGetState();
+		if (usb_state != last_usb_state) {
+			LOG("USB state 0x%03X -> 0x%03X\n", last_usb_state, usb_state);
+			last_usb_state = usb_state;
+		}
+
+		if ((usb_state & PSP_USB_STATUS_CONNECTION_ESTABLISHED) && stream) {
+			ret = send_frame(&stats);
+			if (ret < 0) {
+				stats.errors++;
+				/* Report each distinct error once, then count the repeats. */
+				if (ret != last_frame_err) {
+					LOG("Frame error 0x%08X (%u identical error(s) suppressed before)\n",
+					    ret, suppressed_frame_errs);
+					last_frame_err = ret;
+					suppressed_frame_errs = 0;
+				} else {
+					suppressed_frame_errs++;
+				}
+			} else {
+				last_frame_err = 0;
+			}
+		}
+
+		if ((unsigned int)(sceKernelGetSystemTimeLow() - stats_t0) >= STATS_PERIOD_US) {
+			if (stats.frames || stats.errors) {
+				unsigned int n = stats.frames ? stats.frames : 1;
+				LOG("Stream: %u frames, %u errors, avg CSC %uus, avg USB send %uus\n",
+				    stats.frames, stats.errors, stats.csc_us_total / n,
+				    stats.send_us_total / n);
+			}
+			memset(&stats, 0, sizeof(stats));
+			stats_t0 = sceKernelGetSystemTimeLow();
+		}
+	}
 
 	return 0;
 }
 
 int main(int argc, char *argv[])
 {
-#if ENABLE_LOGGING == 1
-	pspDebugScreenInit();
-#endif
-	SetupCallbacks();
+	struct uvc_state *st = &uvc_st;
+	int ret;
 
-	LOG("UVC. USB Video Class\n");
+	main_thid = sceKernelGetThreadId();
 
-	LOG("Registering USB driver...");
-	int ret = sceUsbbdRegister(&usb_driver);
-	LOG("returned %i\n", ret);
+	/* Not fatal: without a log the plugin still streams, it just cannot report. */
+	log_init(argc > 0 ? argv[0] : NULL);
 
-	LOG("Starting PSP_USBBUS...");
-	ret = sceUsbStart(PSP_USB_BUS_DRIVERNAME, 0, 0);
-	LOG("returned %i\n", ret);
+	LOG("UVC. USB Video Class. argc %d, argv[0] = %s\n", argc, argc > 0 ? argv[0] : "(none)");
 
-	LOG("Starting "USB_DRIVERNAME"...");
-	ret = sceUsbStart(USB_DRIVERNAME, 0, 0);
-	LOG("returned 0x%08X\n", ret);
+	ret = uvc_run(st);
+	if (ret < 0)
+		LOG("UVC aborted: 0x%08X\n", ret);
+	else
+		LOG("UVC stopping\n");
 
-	ret = uvc_frame_req_init();
-	if (ret < 0) {
-		LOG("Error allocating USB request (0x%08X)\n", ret);
-		return ret;
-	}
+	uvc_teardown(st);
+	LOG("UVC done\n");
+	log_shutdown();
 
 	/*
-	 * Set the current streaming settings to the default ones.
+	 * Do not return: the C runtime would call exit(), which ends in
+	 * sceKernelExitGame() and would close the running game.
 	 */
-	memcpy(&uvc_probe_control_setting, &uvc_probe_control_setting_default,
-	       sizeof(uvc_probe_control_setting));
+	main_thid = -1;
+	sceKernelExitDeleteThread(ret < 0 ? ret : 0);
+	return 0;
+}
 
-	stream = 0;
+/*
+ * Called by the system when the plugin is unloaded, e.g. when the XMB is torn
+ * down to start a game. It must never block the system or fail: the main
+ * thread is usually parked in sceDisplayWaitVblankStart(), which does not
+ * return while the display is being shut down, so it is explicitly released
+ * instead of waited on, and killed if it still does not finish in time.
+ */
+int module_stop(SceSize args, void *argp)
+{
+	SceUInt timeout = MODULE_STOP_TIMEOUT_US;
+	SceUID thid = main_thid;
+	int ret;
 
-	LOG("Activating 0x%04X...", USB_PRODUCT_ID);
-	ret = sceUsbActivate(USB_PRODUCT_ID);
-	LOG("returned 0x%08X\n", ret);
+	LOG("module_stop entered\n");
+	log_flush();
 
-	while (run) {
-		SceCtrlData pad;
-		sceCtrlPeekBufferPositive(&pad, 1);
-		if ((pad.Buttons & EXIT_MASK) == EXIT_MASK)
-			run = 0;
+	run = 0;
+	if (uvc_frame_req_evflag >= 0)
+		sceKernelSetEventFlag(uvc_frame_req_evflag, EVENT_STOP_STREAM);
 
-		sceDisplayWaitVblankStart();
-
-		if (sceUsbGetState () & PSP_USB_STATUS_CONNECTION_ESTABLISHED) {
-			if (stream)
-				send_frame();
+	if (thid >= 0 && sceKernelGetThreadId() != thid) {
+		sceKernelReleaseWaitThread(thid);
+		ret = sceKernelWaitThreadEnd(thid, &timeout);
+		if (ret < 0 && main_thid >= 0) {
+			LOG("module_stop: main thread did not finish (0x%08X); terminating it\n", ret);
+			sceKernelTerminateThread(thid);
 		}
 	}
 
-	LOG("UVC exiting!!\n");
+	/*
+	 * The USB bus driver keeps pointers into this module (usb_driver,
+	 * descriptors, endpoints). If the module memory is freed while the driver
+	 * is still registered or active, the next USB event crashes the system.
+	 * No-op when the main thread already unwound everything.
+	 */
+	uvc_teardown(&uvc_st);
+	LOG("module_stop done\n");
+	log_flush();
 
-	//uvc_handle_video_abort();
-	sceKernelSetEventFlag(uvc_frame_req_evflag, EVENT_STOP_STREAM);
-	uvc_frame_req_fini();
-
-	LOG("Deactivating...\n");
-	sceUsbDeactivate(); //USB_PRODUCT_ID??
-	LOG("Stopping " USB_DRIVERNAME "...\n");
-	sceUsbStop(USB_DRIVERNAME, 0, 0 );
-	LOG("Stopping " PSP_USB_BUS_DRIVERNAME "...\n");
-	sceUsbStop(PSP_USB_BUS_DRIVERNAME, 0, 0);
-	LOG("Unregistering USB driver...\n");
-	sceUsbbdUnregister(&usb_driver);
-
-	LOG("Exiting...\n");
 	return 0;
 }
