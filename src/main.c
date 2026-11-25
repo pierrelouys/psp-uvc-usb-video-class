@@ -110,12 +110,18 @@ static volatile int frame_req_transmitted;
 #define TX_BUF_COUNT		2
 #define TX_BUF_ALIGN		64
 #define TX_BUF_STRIDE		(((UVC_CHUNK_SIZE) + TX_BUF_ALIGN - 1) & ~(TX_BUF_ALIGN - 1))
-#define TX_BLOCK_SIZE		(TX_BUF_COUNT * TX_BUF_STRIDE + TX_BUF_ALIGN)
+#if UVC_AUDIO
+#define TX_AUDIO_RING_SIZE	AUDIO_RING_BYTES
+#else
+#define TX_AUDIO_RING_SIZE	0
+#endif
+#define TX_BLOCK_SIZE		(TX_BUF_COUNT * TX_BUF_STRIDE + TX_AUDIO_RING_SIZE + TX_BUF_ALIGN)
 
 _Static_assert(UVC_FRAME_H % UVC_CHUNK_ROWS == 0, "chunks must cover the frame exactly");
 
 static SceUID tx_buf_blk = -1;
 static unsigned char *tx_buf[TX_BUF_COUNT];
+static void *audio_ring_mem;	/* AUDIO_RING_BYTES behind the tx buffers, or NULL */
 
 /* User-partition figures only: documented user API, no kernel internals. */
 static void log_user_memory(void)
@@ -150,6 +156,9 @@ static int tx_buf_alloc(void)
 		memset(base, 0, TX_BUF_COUNT * TX_BUF_STRIDE);
 		for (n = 0; n < TX_BUF_COUNT; n++)
 			tx_buf[n] = base + n * TX_BUF_STRIDE;
+#if UVC_AUDIO
+		audio_ring_mem = base + TX_BUF_COUNT * TX_BUF_STRIDE;
+#endif
 		LOG("tx buffers: %d x %u bytes at %p (%s partition)\n", TX_BUF_COUNT,
 		    (unsigned int)UVC_CHUNK_SIZE, base, names[i]);
 		return 0;
@@ -164,6 +173,7 @@ static void tx_buf_free(void)
 	if (tx_buf_blk >= 0)
 		sceKernelFreePartitionMemory(tx_buf_blk);
 	tx_buf_blk = -1;
+	audio_ring_mem = NULL;
 	for (n = 0; n < TX_BUF_COUNT; n++)
 		tx_buf[n] = NULL;
 }
@@ -355,6 +365,510 @@ static void uvc_handle_video_streaming_req(const struct DeviceRequest *req)
 	}
 }
 
+/*
+ * Audio over USB: a USB Audio Class 1.0 isochronous IN endpoint. The host
+ * selects alternate setting 1 of the streaming interface when an application
+ * opens the device; until then nothing is queued and nothing is captured. A
+ * dedicated thread keeps AUDIO_PKT_SLOTS one-packet (1 ms) requests queued:
+ * each completion refills and requeues its slot.
+ */
+#if UVC_AUDIO
+#define AUDIO_PKT_SLOTS		16
+#define AUDIO_PKT_BUF		(AUDIO_PKT_MAX_FRAMES * AUDIO_FRAME_BYTES)
+#define AUDIO_EV_WAKE		(1u << AUDIO_PKT_SLOTS)
+#define AUDIO_EV_ALL		((1u << (AUDIO_PKT_SLOTS + 1)) - 1)
+#define AUDIO_WAIT_US		250000
+#define AUDIO_CANCEL_WAIT_US	300000
+#define AUDIO_STOP_TIMEOUT_US	500000
+#define AUDIO_RETRY_US		100000
+#define AUDIO_THREAD_PRIORITY	0x1C
+#define AUDIO_THREAD_STACK	(4 * 1024)
+
+_Static_assert(AUDIO_PKT_MAX_FRAMES * AUDIO_FRAME_BYTES <= AUDIO_EP_MAXPACKET,
+	       "audio packets must fit the endpoint's wMaxPacketSize");
+
+static SceUID audio_thid = -1;
+static SceUID audio_evflag = -1;
+static volatile int audio_run;
+static volatile int audio_streaming;
+static unsigned char audio_pkt[AUDIO_PKT_SLOTS][AUDIO_PKT_BUF] __attribute__((aligned(64)));
+/* One request per cache-line-aligned slot: the bus driver updates a request in
+ * place, so it must not share a cache line with its neighbour. */
+struct audio_req_slot {
+	struct UsbbdDeviceRequest r;
+} __attribute__((aligned(64)));
+static struct audio_req_slot audio_req[AUDIO_PKT_SLOTS];
+static volatile int audio_req_rc[AUDIO_PKT_SLOTS];
+static unsigned int audio_pending;	/* slots with a request queued; audio thread only */
+
+static struct {
+	unsigned int packets;
+	unsigned int errors;
+	unsigned int submit_errors;
+	unsigned int stalls;
+} audio_usb_stats;
+
+static void audio_set_alt(int alt)
+{
+	int on = (alt == AUDIO_ALT_STREAMING);
+
+	if (on == audio_streaming)
+		return;
+	LOG("Audio streaming %s\n", on ? "on" : "off");
+	audio_streaming = on;
+	if (audio_evflag >= 0)
+		sceKernelSetEventFlag(audio_evflag, AUDIO_EV_WAKE);
+}
+
+/*
+ * How requests are fed to the isochronous endpoint. The PSP's USB stack is not
+ * documented for isochronous use, so several ways are tried in turn: the first
+ * one that keeps completing requests is kept. Each is tried for
+ * AUDIO_STRAT_TRIAL_US; a strategy "works" if it completes AUDIO_STRAT_MIN_OK
+ * requests in that time.
+ */
+struct audio_strategy {
+	const char *name;
+	int depth;		/* requests kept queued */
+	int pkts;		/* 1 ms packets per request */
+};
+#define AUDIO_BIG_PKTS		4
+#define AUDIO_BIG_SLOTS		4
+#define AUDIO_STRAT_MIN_OK	20
+
+static const struct audio_strategy audio_strategies[] = {
+	/* Measured on the PSP: only a request queued after the previous one completed
+	 * keeps completing. Queueing several ahead stalls after the first. */
+	{ "1 deep, one packet per request", 1, 1 },
+	{ "1 deep, 4 packets per request", 1, AUDIO_BIG_PKTS },
+	{ "16 deep, one packet per request", AUDIO_PKT_SLOTS, 1 },
+	{ "2 deep, one packet per request", 2, 1 },
+	{ "4 deep, one packet per request", 4, 1 },
+};
+/* A bus capture showed that with one request in flight the host almost never
+ * receives a packet (the request completes, but the packet is gone before the
+ * host polls). UVC_AUDIO_STRATEGY picks the first strategy tried; a request
+ * queued ahead of the boundary is what has to be tested. */
+#ifndef UVC_AUDIO_STRATEGY
+#define UVC_AUDIO_STRATEGY	0
+#endif
+#define AUDIO_STRATEGY_COUNT	((int)(sizeof(audio_strategies) / sizeof(audio_strategies[0])))
+
+static unsigned char audio_big[AUDIO_BIG_SLOTS][AUDIO_BIG_PKTS * AUDIO_PKT_BUF] __attribute__((aligned(64)));
+static int audio_strategy_idx = UVC_AUDIO_STRATEGY;
+static int audio_ev_printed;
+static unsigned int audio_strategy_ok;	/* completions with rc == 0 under the current strategy */
+
+/* The first completions, recorded in the callback and printed from the main loop. */
+#define AUDIO_TRACE_MAX		12
+struct audio_trace {
+	unsigned int time_us;
+	int slot, rc, transmitted, size;
+};
+static struct audio_trace audio_trace[AUDIO_TRACE_MAX];
+static volatile int audio_trace_count;
+static int audio_trace_printed;
+
+static unsigned int audio_last_done_us;
+static unsigned int audio_dt_min = 0xFFFFFFFFu, audio_dt_max, audio_dt_sum, audio_dt_n;
+
+static void audio_pkt_on_complete(struct UsbbdDeviceRequest *req)
+{
+	int idx = (int)(((const unsigned char *)req - (const unsigned char *)audio_req) /
+			sizeof(struct audio_req_slot));
+	int n = audio_trace_count;
+	unsigned int now = sceKernelGetSystemTimeLow();
+
+	if (req->returnCode == 0 && audio_last_done_us != 0) {
+		unsigned int dt = now - audio_last_done_us;
+
+		if (dt < audio_dt_min)
+			audio_dt_min = dt;
+		if (dt > audio_dt_max)
+			audio_dt_max = dt;
+		audio_dt_sum += dt;
+		audio_dt_n++;
+	}
+	audio_last_done_us = now;
+
+	if (idx < 0 || idx >= AUDIO_PKT_SLOTS)
+		return;
+	if (n < AUDIO_TRACE_MAX) {
+		audio_trace[n].time_us = now;
+		audio_trace[n].slot = idx;
+		audio_trace[n].rc = req->returnCode;
+		audio_trace[n].transmitted = req->transmitted;
+		audio_trace[n].size = req->size;
+		audio_trace_count = n + 1;
+	}
+	audio_req_rc[idx] = req->returnCode;
+	if (audio_evflag >= 0)
+		sceKernelSetEventFlag(audio_evflag, 1u << idx);
+}
+
+/*
+ * The PSP bus driver normally targets isochronous packets at frame
+ * (FN + 1) | (interval mask), which makes almost every packet miss the host's
+ * poll. Measured on hardware: with the mask removed and "+ 1" kept, about 96% of
+ * polls receive a packet (mask on: none; "+ 7": about 80%).
+ */
+#ifndef UVC_AUDIO_REPEAT
+#define UVC_AUDIO_REPEAT	1
+#endif
+
+#ifndef UVC_USBBUS_PATCH
+#define UVC_USBBUS_PATCH	1
+#endif
+#ifndef UVC_USBBUS_ADD
+#define UVC_USBBUS_ADD		1
+#endif
+#ifndef UVC_USBBUS_MASK
+#define UVC_USBBUS_MASK		0
+#endif
+
+#ifndef UVC_AUDIO_RT_INTERVAL
+#define UVC_AUDIO_RT_INTERVAL	0
+#endif
+
+#ifndef UVC_AUDIO_SWEEP
+#define UVC_AUDIO_SWEEP		0
+#endif
+#ifndef UVC_AUDIO_FRAMESWEEP
+#define UVC_AUDIO_FRAMESWEEP	0
+#endif
+#define FSW_COUNT		12
+#if UVC_AUDIO_SWEEP || UVC_AUDIO_FRAMESWEEP
+/*
+ * Timing experiment (make UVC_AUDIO_SWEEP=1). A bus capture of the real stream
+ * showed the host polls the endpoint every millisecond and gets a zero-length
+ * answer almost every time: a packet only reaches the host if it is queued at
+ * the right moment relative to the host's frame. Completions are locked to
+ * that frame, so the delay between a completion and the next send is the
+ * phase. This sends fixed 44-frame packets after a delay that sweeps from 0
+ * to SWEEP_PERIOD_US, and writes the measured delay (left channel, in us) and a
+ * sequence number (right channel, 0x4000 | n) into the samples, so every packet
+ * that does reach the host says which delay got it there.
+ */
+#define SWEEP_PERIOD_US		1200u
+#define SWEEP_STEP_US		4u
+#define SWEEP_FRAMES		44
+static unsigned int sweep_seq;
+#endif
+
+static int audio_submit(int i)
+{
+	const struct audio_strategy *st = &audio_strategies[audio_strategy_idx];
+	unsigned char *buf = st->pkts > 1 ? audio_big[i] : audio_pkt[i];
+	int bytes = 0;
+	int k, ret;
+
+#if UVC_AUDIO_FRAMESWEEP
+	{
+		/* Experiment: every second the USB bus driver's frame targeting is
+		 * changed (setting 0 is the stock behaviour) and the test packets
+		 * carry the setting in the left channel, so the ones that reach the
+		 * host show which setting works. */
+		static const struct { unsigned char add, mask; } fsw[FSW_COUNT] = {
+			{ 1, 1 }, { 0, 1 }, { 1, 0 }, { 0, 0 }, { 2, 0 }, { 3, 0 },
+			{ 4, 0 }, { 5, 0 }, { 6, 0 }, { 7, 0 }, { 8, 0 }, { 9, 0 },
+		};
+		static int fsw_cur = -1;
+		int setting = (int)((sceKernelGetSystemTimeLow() / 1000000u) % FSW_COUNT);
+		short *p = (short *)buf;
+		int n;
+
+		(void)k;
+		if (setting != fsw_cur) {
+			usbbus_target_patch(fsw[setting].add, fsw[setting].mask);
+			fsw_cur = setting;
+		}
+		for (n = 0; n < SWEEP_FRAMES; n++) {
+			p[n * 2] = (short)(setting + 1);
+			p[n * 2 + 1] = (short)(0x4000u | (sweep_seq & 0x3FFFu));
+		}
+		sweep_seq++;
+		bytes = SWEEP_FRAMES * AUDIO_FRAME_BYTES;
+	}
+#elif UVC_AUDIO_SWEEP
+	{
+		unsigned int target = (sweep_seq * SWEEP_STEP_US) % SWEEP_PERIOD_US;
+		unsigned int x;
+		short *p = (short *)buf;
+		int n;
+
+		(void)k;
+		if (target)
+			sceKernelDelayThread(target);
+		x = sceKernelGetSystemTimeLow() - audio_last_done_us;
+		if (x > 30000u)
+			x = 30000u;
+		for (n = 0; n < SWEEP_FRAMES; n++) {
+			p[n * 2] = (short)x;
+			p[n * 2 + 1] = (short)(0x4000u | (sweep_seq & 0x3FFFu));
+		}
+		sweep_seq++;
+		bytes = SWEEP_FRAMES * AUDIO_FRAME_BYTES;
+	}
+#else
+	for (k = 0; k < st->pkts; k++) {
+		int tries;
+
+#if UVC_AUDIO_REPEAT
+		if (st->pkts == 1) {
+			/*
+			 * With the bus driver patched (see UVC_USBBUS_*) one request
+			 * completes per microframe, but the host only polls once per
+			 * millisecond and a packet is only on the wire for the
+			 * microframe it was armed in. So the same millisecond of audio is
+			 * sent over and over until the next one is due; whichever copy
+			 * the host polls is then the right one.
+			 */
+			static unsigned char chunk[AUDIO_PKT_BUF] __attribute__((aligned(64)));
+			static int chunk_bytes;
+
+			if (chunk_bytes == 0 || audio_frames_ready() >= AUDIO_MIN_PKT_FRAMES)
+				chunk_bytes = audio_pull(chunk) * AUDIO_FRAME_BYTES;
+			memcpy(buf, chunk, chunk_bytes);
+			bytes = chunk_bytes;
+			continue;
+		}
+#endif
+		/* wait until a worthwhile amount of real time has passed */
+		for (tries = 0; tries < 60 && audio_run && audio_streaming &&
+		     audio_frames_ready() < AUDIO_MIN_PKT_FRAMES; tries++)
+			sceKernelDelayThread(100);
+		bytes += audio_pull(buf + bytes) * AUDIO_FRAME_BYTES;
+	}
+#endif
+
+	sceKernelDcacheWritebackRange(buf, bytes);
+	audio_req[i].r = (struct UsbbdDeviceRequest){
+		.endpoint = &endpoints[AUDIO_ENDPOINT_INDEX],
+		.data = buf,
+		.size = bytes,
+		.isControlRequest = 0,
+		.onComplete = audio_pkt_on_complete,
+		.transmitted = 0,
+		.returnCode = 0,
+		.next = NULL,
+		.unused = NULL,
+		.physicalAddress = NULL
+	};
+	ret = sceUsbbdReqSend(&audio_req[i].r);
+	if (ret >= 0)
+		audio_pending |= 1u << i;
+	return ret;
+}
+
+/* Cancel what is queued and wait until the bus driver has given every request back. */
+static void audio_drain_queue(void)
+{
+	u32 bits;
+	int ret;
+
+	sceUsbbdReqCancelAll(&endpoints[AUDIO_ENDPOINT_INDEX]);
+	while (audio_pending) {
+		SceUInt timeout = AUDIO_CANCEL_WAIT_US;
+
+		bits = 0;
+		ret = sceKernelWaitEventFlag(audio_evflag, AUDIO_EV_ALL,
+					     PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits, &timeout);
+		if (ret < 0) {
+			LOG("audio: %u cancelled request(s) never completed: 0x%08X\n", audio_pending, ret);
+			break;
+		}
+		audio_pending &= ~(bits & ((1u << AUDIO_PKT_SLOTS) - 1));
+	}
+	audio_pending = 0;
+}
+
+/* Runs while the host has the streaming interface open. */
+static void audio_stream_session(void)
+{
+	static int logged_submit_err;
+	u32 bits = 0;
+	int i, ret = 0;
+	int idle_logged = 0;
+
+	/* completions left over from an earlier session */
+	sceKernelPollEventFlag(audio_evflag, AUDIO_EV_ALL, PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits);
+	audio_pending = 0;
+	audio_strategy_ok = 0;
+#if UVC_USBBUS_PATCH
+	/* applied again here, with the stream starting, as the working sweep did */
+	usbbus_target_patch(UVC_USBBUS_ADD, UVC_USBBUS_MASK);
+#endif
+	audio_capture_set_active(1);
+
+	while (audio_run && audio_streaming) {
+		const struct audio_strategy *st = &audio_strategies[audio_strategy_idx];
+		SceUInt timeout = AUDIO_WAIT_US;
+
+		bits = 0;
+		if (audio_pending == 0) {
+			/* nothing on the wire: (re)prime the queue */
+			for (i = 0; i < st->depth; i++) {
+				ret = audio_submit(i);
+				if (ret < 0)
+					break;
+			}
+			if (audio_pending == 0) {
+				audio_usb_stats.submit_errors++;
+				if (!logged_submit_err) {
+					logged_submit_err = 1;
+					LOG("audio: sceUsbbdReqSend on the isochronous endpoint failed: 0x%08X\n", ret);
+				}
+				sceKernelDelayThread(AUDIO_RETRY_US);
+				continue;
+			}
+			if (!idle_logged) {
+				idle_logged = 1;
+				LOG("audio: strategy %d (%s): %d request(s) queued\n", audio_strategy_idx,
+				    st->name, st->depth);
+			}
+		}
+
+		ret = sceKernelWaitEventFlag(audio_evflag, AUDIO_EV_ALL,
+					     PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits, &timeout);
+		if (ret < 0) {
+			/* queued, but the host is not collecting */
+			audio_usb_stats.stalls++;
+			if (audio_strategy_ok < AUDIO_STRAT_MIN_OK &&
+			    audio_strategy_idx + 1 < AUDIO_STRATEGY_COUNT) {
+				LOG("audio: strategy %d (%s) stalled after %u completion(s); trying the next\n",
+				    audio_strategy_idx, st->name, audio_strategy_ok);
+				audio_drain_queue();
+				audio_strategy_idx++;
+				audio_strategy_ok = 0;
+				idle_logged = 0;
+			} else if (audio_strategy_ok < AUDIO_STRAT_MIN_OK) {
+				static int logged_final;
+
+				if (!logged_final) {
+					logged_final = 1;
+					LOG("audio: no strategy keeps the isochronous endpoint completing\n");
+				}
+			}
+			continue;
+		}
+
+		for (i = 0; i < AUDIO_PKT_SLOTS; i++) {
+			int rc;
+
+			if (!(bits & (1u << i)))
+				continue;
+			audio_pending &= ~(1u << i);
+			rc = audio_req_rc[i];
+			if (rc == PSP_USB_RETCODE_CANCELTRANSMISSION || rc == PSP_USB_RETCODE_CANCEL ||
+			    rc == PSP_USB_RETCODE_CANCEL_ALL)
+				continue;
+			if (rc != 0) {
+				static int last_rc;
+
+				audio_usb_stats.errors++;
+				if (rc != last_rc) {
+					last_rc = rc;
+					LOG("audio: packet completed with error 0x%08X\n", rc);
+				}
+			} else {
+				audio_usb_stats.packets++;
+				audio_strategy_ok++;
+			}
+			if (!audio_run || !audio_streaming)
+				continue;
+			ret = audio_submit(i);
+			if (ret < 0) {
+				audio_usb_stats.submit_errors++;
+				if (!logged_submit_err) {
+					logged_submit_err = 1;
+					LOG("audio: requeue failed: 0x%08X\n", ret);
+				}
+			}
+		}
+	}
+
+	/* The requests and buffers must not be reused while the bus driver owns them. */
+	audio_capture_set_active(0);
+	audio_drain_queue();
+}
+
+static int audio_thread(SceSize args, void *argp)
+{
+#if UVC_USBBUS_PATCH
+	/* see the comment above usbbus_target_patch() in audio.c */
+	usbbus_target_patch(UVC_USBBUS_ADD, UVC_USBBUS_MASK);
+#endif
+	while (audio_run) {
+		u32 bits = 0;
+		SceUInt timeout = AUDIO_WAIT_US;
+
+		if (audio_streaming) {
+			audio_stream_session();
+			continue;
+		}
+		sceKernelWaitEventFlag(audio_evflag, AUDIO_EV_WAKE,
+				       PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits, &timeout);
+	}
+	return 0;
+}
+
+static int audio_usb_start(void)
+{
+	int ret;
+
+	audio_evflag = sceKernelCreateEventFlag("uvc_audio_evflag", 0, 0, NULL);
+	if (audio_evflag < 0) {
+		ret = audio_evflag;
+		audio_evflag = -1;
+		return ret;
+	}
+	audio_run = 1;
+	audio_streaming = 0;
+	audio_thid = sceKernelCreateThread("uvc_audio", audio_thread, AUDIO_THREAD_PRIORITY,
+					   AUDIO_THREAD_STACK, 0, NULL);
+	if (audio_thid < 0) {
+		ret = audio_thid;
+		audio_thid = -1;
+		return ret;
+	}
+	ret = sceKernelStartThread(audio_thid, 0, NULL);
+	if (ret < 0) {
+		sceKernelDeleteThread(audio_thid);
+		audio_thid = -1;
+	}
+	return ret;
+}
+
+static void audio_usb_stop(void)
+{
+	SceUID thid = audio_thid;
+	SceUID evid = audio_evflag;
+
+	audio_run = 0;
+	audio_streaming = 0;
+	if (evid >= 0)
+		sceKernelSetEventFlag(evid, AUDIO_EV_WAKE);
+	if (thid >= 0) {
+		SceUInt timeout = AUDIO_STOP_TIMEOUT_US;
+
+		if (sceKernelWaitThreadEnd(thid, &timeout) < 0) {
+			LOG("audio thread did not finish; terminating it\n");
+			sceKernelTerminateThread(thid);
+		}
+		sceKernelDeleteThread(thid);
+		audio_thid = -1;
+	}
+	audio_evflag = -1;
+	if (evid >= 0)
+		sceKernelDeleteEventFlag(evid);
+}
+#else
+static inline void audio_set_alt(int alt)
+{
+	(void)alt;
+}
+#endif
+
 static void uvc_handle_video_abort(void)
 {
 	LOG("uvc_handle_video_abort\n");
@@ -375,6 +889,10 @@ static void usb_handle_set_interface(const struct DeviceRequest *req)
 	 * stopping to stream. This application needs to stop streaming. */
 	if ((req->wIndex == STREAM_INTERFACE) && (req->wValue == 0))
 		uvc_handle_video_abort();
+#if UVC_AUDIO
+	if ((req->wIndex & 0xFF) == AUDIO_STREAM_INTERFACE)
+		audio_set_alt(req->wValue);
+#endif
 }
 
 static void usb_handle_clear_feature(const struct DeviceRequest *req)
@@ -466,11 +984,35 @@ static int usb_process_request(int recipient, int arg, struct DeviceRequest *req
 static int usb_change_setting(int interfaceNumber, int alternateSetting)
 {
 	LOG("usb_change %d %d\n", interfaceNumber, alternateSetting);
+#if UVC_AUDIO
+	if (interfaceNumber == AUDIO_STREAM_INTERFACE) {
+#if UVC_AUDIO_RT_INTERVAL
+		/*
+		 * The bus driver arms an isochronous packet for frame
+		 * (FN + 1) | ((1 << (bInterval - 1)) - 1), reading bInterval when
+		 * the alternate setting is activated. Windows only streams if the
+		 * descriptor it read says 4, so the host keeps seeing 4 and the
+		 * value is lowered here, after the host has read the descriptors
+		 * and before it selects alternate setting 1.
+		 */
+		if (alternateSetting == 0)
+			endpdesc_hi[1].bInterval = UVC_AUDIO_RT_INTERVAL;
+#endif
+		audio_set_alt(alternateSetting);
+	}
+#endif
 	return 0;
 }
 
+static volatile int usb_attached;	/* the host configured the device since the last activate */
+
 static int usb_attach(int usb_version)
 {
+#if UVC_AUDIO && UVC_AUDIO_RT_INTERVAL
+	/* a new enumeration must see the real descriptor again */
+	endpdesc_hi[1].bInterval = UVC_AUDIO_HS_INTERVAL;
+#endif
+	usb_attached = 1;
 	LOG("usb_attach %d\n", usb_version);
 	return 0;
 }
@@ -479,6 +1021,7 @@ static void usb_detach(void)
 {
 	LOG("usb_detach\n");
 	uvc_handle_video_abort();
+	audio_set_alt(0);
 }
 
 static void usb_configure(int usb_version, int desc_count, struct InterfaceSettings *settings)
@@ -496,12 +1039,13 @@ static int usb_driver_stop(int size, void *args)
 {
 	LOG("usb_driver_stop\n");
 	uvc_handle_video_abort();
+	audio_set_alt(0);
 	return 0;
 }
 
 static struct UsbDriver usb_driver = {
 	.driverName			= USB_DRIVERNAME,
-	.numEndpoints			= 2,
+	.numEndpoints			= NUM_ENDPOINTS,
 	.endpoints			= endpoints,
 	.interface			= &interface,
 	.descriptor_hi			= &devdesc_hi,
@@ -766,6 +1310,8 @@ struct uvc_state {
 	int activated;
 	int evflag_created;
 	int tx_buf_allocated;
+	int audio_hooked;
+	int audio_started;
 };
 
 /* Shared with module_stop(), which must be able to unwind the USB driver
@@ -777,6 +1323,17 @@ static void uvc_teardown(struct uvc_state *st)
 	int ret;
 
 	uvc_handle_video_abort();
+
+#if UVC_AUDIO
+	/* Hooks first: no game thread may enter our code once the ring is going.
+	 * Then the audio thread, before the USB driver and the memory under it. */
+	if (st->audio_hooked) {
+		audio_capture_shutdown();
+		LOG("audio capture shut down\n");
+	}
+	if (st->audio_started)
+		audio_usb_stop();
+#endif
 
 	if (st->activated) {
 		ret = sceUsbDeactivate();
@@ -803,11 +1360,77 @@ static void uvc_teardown(struct uvc_state *st)
 	memset(st, 0, sizeof(*st));
 }
 
+#if UVC_AUDIO
+/* Enumeration never completed: re-register the driver with a smaller descriptor set. */
+#define UVC_ENUM_TIMEOUT_US	3000000
+
+static void uvc_usb_degrade(struct uvc_state *st, int level)
+{
+	int ret;
+
+	LOG("USB host never configured the device; retrying with %s\n",
+	    level == 1 ? "no class-specific audio endpoint descriptor" : "video only (no audio)");
+	log_flush();
+
+	audio_set_alt(0);
+	if (st->activated) {
+		ret = sceUsbDeactivate();
+		LOG("sceUsbDeactivate: 0x%08X\n", ret);
+		st->activated = 0;
+	}
+	if (st->driver_started) {
+		ret = sceUsbStop(USB_DRIVERNAME, 0, 0);
+		LOG("sceUsbStop(" USB_DRIVERNAME "): 0x%08X\n", ret);
+		st->driver_started = 0;
+	}
+	if (st->driver_registered) {
+		ret = sceUsbbdUnregister(&usb_driver);
+		LOG("sceUsbbdUnregister: 0x%08X\n", ret);
+		st->driver_registered = 0;
+	}
+
+	uvc_descriptors_degrade(level);
+	if (level >= 2) {
+		usb_driver.numEndpoints = 2;
+		if (st->audio_hooked) {
+			audio_capture_shutdown();
+			st->audio_hooked = 0;
+		}
+		if (st->audio_started) {
+			audio_usb_stop();
+			st->audio_started = 0;
+		}
+	}
+
+	ret = sceUsbbdRegister(&usb_driver);
+	LOG("sceUsbbdRegister: 0x%08X\n", ret);
+	if (ret < 0)
+		return;
+	st->driver_registered = 1;
+	ret = sceUsbStart(USB_DRIVERNAME, 0, 0);
+	LOG("sceUsbStart(" USB_DRIVERNAME "): 0x%08X\n", ret);
+	if (ret < 0)
+		return;
+	st->driver_started = 1;
+	memcpy(&uvc_probe_control_setting, &uvc_probe_control_setting_default,
+	       sizeof(uvc_probe_control_setting));
+	stream = 0;
+	usb_attached = 0;
+	ret = sceUsbActivate(USB_PRODUCT_ID);
+	LOG("sceUsbActivate(0x%04X): 0x%08X\n", USB_PRODUCT_ID, ret);
+	if (ret >= 0)
+		st->activated = 1;
+}
+#endif
+
 static int uvc_run(struct uvc_state *st)
 {
 	struct stream_stats stats = {0};
 	unsigned int stats_t0;
 	int last_usb_state = -1;
+	int degrade_level = 0;
+	unsigned int enum_bad_since = 0;
+	int enum_bad = 0;
 	int last_frame_err = 0;
 	unsigned int suppressed_frame_errs = 0;
 	int ret;
@@ -824,6 +1447,24 @@ static int uvc_run(struct uvc_state *st)
 	if (ret < 0)
 		return ret;
 	st->tx_buf_allocated = 1;
+
+#if UVC_AUDIO
+	log_flush();	/* everything so far on disk before the audio setup */
+	ret = audio_usb_start();
+	if (ret < 0)
+		LOG("audio: could not start the audio thread: 0x%08X; no audio\n", ret);
+	else
+		st->audio_started = 1;
+#if UVC_AUDIO_HOOKS
+	/* Not fatal: without the hooks the stream carries silence. */
+	ret = audio_capture_init(audio_ring_mem);
+	if (ret < 0)
+		LOG("audio: capture unavailable (%d); the audio stream will be silent\n", ret);
+	st->audio_hooked = 1;
+#else
+	LOG("audio: built without capture hooks (UVC_AUDIO_HOOKS=0); the audio stream is silent\n");
+#endif
+#endif
 
 	ret = sceUsbbdRegister(&usb_driver);
 	LOG("sceUsbbdRegister: 0x%08X\n", ret);
@@ -852,6 +1493,16 @@ static int uvc_run(struct uvc_state *st)
 	       sizeof(uvc_probe_control_setting));
 	stream = 0;
 
+	LOG("endpoints: [1] number %d driver %d, [%d] number %d driver %d\n",
+	    endpoints[1].endpointNumber, endpoints[1].driverEndpointNumber,
+	    NUM_ENDPOINTS - 1, endpoints[NUM_ENDPOINTS - 1].endpointNumber,
+	    endpoints[NUM_ENDPOINTS - 1].driverEndpointNumber);
+	LOG("descriptors: wTotalLength hi %u full %u, %d interfaces, %d endpoints; "
+	    "endpdesc %p interdesc %p settings %p\n", (unsigned int)confdesc_hi.wTotalLength,
+	    (unsigned int)confdesc_full.wTotalLength, (int)confdesc_hi.bNumInterfaces,
+	    (int)usb_driver.numEndpoints, (void *)endpdesc_hi, (void *)interdesc_hi,
+	    (void *)settings_hi);
+	usb_attached = 0;
 	ret = sceUsbActivate(USB_PRODUCT_ID);
 	LOG("sceUsbActivate(0x%04X): 0x%08X\n", USB_PRODUCT_ID, ret);
 	if (ret < 0)
@@ -872,6 +1523,32 @@ static int uvc_run(struct uvc_state *st)
 			LOG("USB state 0x%03X -> 0x%03X\n", last_usb_state, usb_state);
 			last_usb_state = usb_state;
 		}
+
+#if UVC_AUDIO
+		/*
+		 * Cable in, state "unknown" and the host never configured us: it
+		 * refused the descriptors. Try a smaller set instead of leaving the
+		 * device dead (video must keep working whatever the audio does).
+		 */
+		if (degrade_level < 2 && !usb_attached &&
+		    (usb_state & PSP_USB_STATUS_CABLE_CONNECTED) &&
+		    (usb_state & PSP_USB_STATUS_CONNECTION_UNKNOWN)) {
+			unsigned int now = sceKernelGetSystemTimeLow();
+
+			if (!enum_bad) {
+				enum_bad = 1;
+				enum_bad_since = now;
+			} else if ((unsigned int)(now - enum_bad_since) >= UVC_ENUM_TIMEOUT_US) {
+				degrade_level++;
+				uvc_usb_degrade(st, degrade_level);
+				enum_bad = 0;
+				last_usb_state = -1;
+				continue;
+			}
+		} else {
+			enum_bad = 0;
+		}
+#endif
 
 		if ((usb_state & PSP_USB_STATUS_CONNECTION_ESTABLISHED) && stream) {
 			ret = send_frame(&stats);
@@ -898,6 +1575,66 @@ static int uvc_run(struct uvc_state *st)
 				    stats.frames, stats.errors, stats.csc_us_total / n,
 				    stats.send_us_total / n);
 			}
+#if UVC_AUDIO
+			{
+				struct audio_stats as;
+				struct audio_probe pr;
+
+				audio_get_stats(&as);
+				audio_probe_table(&pr);
+				LOG("Audio probe: syscall table A %p wrappers %u origs %u, B %p wrappers %u origs %u\n",
+				    (void *)pr.base[0], pr.wrappers[0], pr.origs[0], (void *)pr.base[1],
+				    pr.wrappers[1], pr.origs[1]);
+				LOG("Audio (cumulative): %u packets, %u errors, %u submit errors, %u stalls\n",
+				    audio_usb_stats.packets, audio_usb_stats.errors,
+				    audio_usb_stats.submit_errors, audio_usb_stats.stalls);
+				LOG("  capture: hooks 0x%03X, %u calls, %u frames in, %u late, %u overflow, "
+				    "%u bad ptr, %u unknown len, resyncs chan %u read %u, channels 0x%03X\n",
+				    as.hooks_mask, as.calls, as.frames_in, as.frames_late,
+				    as.frames_overflow, as.bad_ptr, as.unknown_len, as.chan_resyncs,
+				    as.pull_resyncs, as.channels_seen);
+				LOG("  wrapper calls: ChReserve %u SetLen %u Config %u Out %u OutBlk %u Pan %u "
+				    "PanBlk %u SRCRes %u SRCBlk %u O2Res %u O2Blk %u O2Len %u; capture active %u\n",
+				    as.wrapper_calls[0], as.wrapper_calls[1], as.wrapper_calls[2],
+				    as.wrapper_calls[3], as.wrapper_calls[4], as.wrapper_calls[5],
+				    as.wrapper_calls[6], as.wrapper_calls[7], as.wrapper_calls[8],
+				    as.wrapper_calls[9], as.wrapper_calls[10], as.wrapper_calls[11],
+				    as.active_now);
+				if (audio_dt_n) {
+					LOG("  iso completion interval us: min %u avg %u max %u over %u\n",
+					    audio_dt_min, audio_dt_sum / audio_dt_n, audio_dt_max, audio_dt_n);
+					audio_dt_min = 0xFFFFFFFFu;
+					audio_dt_max = audio_dt_sum = audio_dt_n = 0;
+				}
+				LOG("  levels since last report (of 32767): game audio in %u, sent to USB %u\n",
+				    as.peak_in, as.peak_out);
+				LOG("  iso endpoint: number %d (driver %d), %d bytes transmitted\n",
+				    endpoints[AUDIO_ENDPOINT_INDEX].endpointNumber,
+				    endpoints[AUDIO_ENDPOINT_INDEX].driverEndpointNumber,
+				    endpoints[AUDIO_ENDPOINT_INDEX].transmittedBytes);
+			}
+			/* new first-calls and first-completions, if any */
+			for (;;) {
+				struct audio_event ev[8];
+				int from = audio_ev_printed;
+				int n = audio_get_events(ev, from, 8, NULL);
+				int k;
+
+				if (n <= from)
+					break;
+				for (k = 0; k < n - from; k++)
+					LOG("  audio call: %s(%d, %d, %d) = %d%s [%u]\n", audio_hook_name(ev[k].hook),
+					    ev[k].a0, ev[k].a1, ev[k].a2, ev[k].ret,
+					    ev[k].active ? "" : " (capture not active)", ev[k].time_us);
+				audio_ev_printed = n;
+			}
+			while (audio_trace_printed < audio_trace_count) {
+				struct audio_trace *t = &audio_trace[audio_trace_printed++];
+
+				LOG("  iso completion: slot %d rc 0x%08X transmitted %d of %d [%u]\n",
+				    t->slot, t->rc, t->transmitted, t->size, t->time_us);
+			}
+#endif
 			memset(&stats, 0, sizeof(stats));
 			stats_t0 = sceKernelGetSystemTimeLow();
 		}

@@ -1,4 +1,20 @@
+#include <string.h>
 #include "uvc.h"
+#include "uac.h"
+#include "audio.h"
+
+/* Build with UVC_AUDIO=0 (see Makefile) for a video-only device. */
+#ifndef UVC_AUDIO
+#define UVC_AUDIO 1
+#endif
+/* USB endpoint number of the audio IN endpoint (the driver slot stays endpoints[2]). */
+#ifndef UVC_AUDIO_EP
+#define UVC_AUDIO_EP 2
+#endif
+/* Capture hooks on the sceAudio syscalls; 0 keeps the (silent) audio device only. */
+#ifndef UVC_AUDIO_HOOKS
+#define UVC_AUDIO_HOOKS 1
+#endif
 
 /*
  * USB definitions
@@ -23,6 +39,28 @@
 #define OUTPUT_TERMINAL_ID		2
 
 #define FORMAT_INDEX_UNCOMPRESSED_YUY2	1
+
+#if UVC_AUDIO
+/* Audio function: dummy interface (carries the IAD), control, streaming. */
+#define AUDIO_DUMMY_INTERFACE		3
+#define AUDIO_CONTROL_INTERFACE		4
+#define AUDIO_STREAM_INTERFACE		5
+#define AUDIO_INPUT_TERMINAL_ID		1
+#define AUDIO_OUTPUT_TERMINAL_ID	2
+#define AUDIO_ENDPOINT_INDEX		2	/* endpoints[] slot and endpoint number */
+#define AUDIO_ALT_STREAMING		1
+#define AUDIO_EP_MAXPACKET		192	/* >= AUDIO_PKT_MAX_FRAMES * 4 */
+
+/* High-speed bInterval of the audio endpoint (see Makefile) */
+#ifndef UVC_AUDIO_HS_INTERVAL
+#define UVC_AUDIO_HS_INTERVAL	4
+#endif
+#define NUM_INTERFACES			6
+#define NUM_ENDPOINTS			3
+#else
+#define NUM_INTERFACES			3
+#define NUM_ENDPOINTS			2
+#endif
 
 /*
  * Helper macros
@@ -149,19 +187,156 @@ static struct __attribute__((packed)) {
 	},
 };
 
+#if UVC_AUDIO
+/* Interface Association Descriptor for the audio function */
+static
+unsigned char audio_interface_association_descriptor[] = {
+	UVC_INTERFACE_ASSOCIATION_DESC_SIZE,		/* Descriptor Size: 8 */
+	UVC_INTERFACE_ASSOCIATION_DESCRIPTOR_TYPE,	/* Interface Association Descr Type: 11 */
+	AUDIO_CONTROL_INTERFACE,			/* First AudioControl interface */
+	0x02,						/* Number of audio interfaces */
+	USB_CLASS_AUDIO,				/* Function class */
+	UAC_SC_UNDEFINED,				/* Function subclass */
+	0x00,						/* Function protocol */
+	0x00,						/* String desc index for function */
+};
+
+static struct __attribute__((packed)) {
+	struct uac_ac_header_descriptor header;
+	struct uac_input_terminal_descriptor input_terminal;
+	struct uac_output_terminal_descriptor output_terminal;
+} audio_control_descriptors = {
+	.header = {
+		.bLength		= sizeof(audio_control_descriptors.header),
+		.bDescriptorType	= UAC_DT_CS_INTERFACE,
+		.bDescriptorSubtype	= UAC_AC_HEADER,
+		.bcdADC			= 0x0100,
+		.wTotalLength		= sizeof(audio_control_descriptors),
+		.bInCollection		= 1,
+		.baInterfaceNr		= {AUDIO_STREAM_INTERFACE},
+	},
+	.input_terminal = {
+		.bLength		= sizeof(audio_control_descriptors.input_terminal),
+		.bDescriptorType	= UAC_DT_CS_INTERFACE,
+		.bDescriptorSubtype	= UAC_AC_INPUT_TERMINAL,
+		.bTerminalID		= AUDIO_INPUT_TERMINAL_ID,
+		.wTerminalType		= UAC_TERMINAL_LINE_CONNECTOR,
+		.bAssocTerminal		= 0,
+		.bNrChannels		= 2,
+		.wChannelConfig		= UAC_CHANNEL_LEFT_FRONT | UAC_CHANNEL_RIGHT_FRONT,
+		.iChannelNames		= 0,
+		.iTerminal		= 0,
+	},
+	.output_terminal = {
+		.bLength		= sizeof(audio_control_descriptors.output_terminal),
+		.bDescriptorType	= UAC_DT_CS_INTERFACE,
+		.bDescriptorSubtype	= UAC_AC_OUTPUT_TERMINAL,
+		.bTerminalID		= AUDIO_OUTPUT_TERMINAL_ID,
+		.wTerminalType		= UAC_TERMINAL_USB_STREAMING,
+		.bAssocTerminal		= 0,
+		.bSourceID		= AUDIO_INPUT_TERMINAL_ID,
+		.iTerminal		= 0,
+	},
+};
+
+/* Class-specific descriptors of the streaming interface's alternate setting 1 */
+static struct __attribute__((packed)) {
+	struct uac_as_general_descriptor general;
+	struct uac_format_type_i_descriptor format;
+} audio_streaming_descriptors = {
+	.general = {
+		.bLength		= sizeof(audio_streaming_descriptors.general),
+		.bDescriptorType	= UAC_DT_CS_INTERFACE,
+		.bDescriptorSubtype	= UAC_AS_GENERAL,
+		.bTerminalLink		= AUDIO_OUTPUT_TERMINAL_ID,
+		.bDelay			= 1,
+		.wFormatTag		= UAC_FORMAT_TAG_PCM,
+	},
+	.format = {
+		.bLength		= sizeof(audio_streaming_descriptors.format),
+		.bDescriptorType	= UAC_DT_CS_INTERFACE,
+		.bDescriptorSubtype	= UAC_AS_FORMAT_TYPE,
+		.bFormatType		= UAC_FORMAT_TYPE_I,
+		.bNrChannels		= 2,
+		.bSubframeSize		= 2,
+		.bBitResolution		= 16,
+		.bSamFreqType		= 1,
+		.tSamFreq		= {AUDIO_RATE & 0xFF, (AUDIO_RATE >> 8) & 0xFF, (AUDIO_RATE >> 16) & 0xFF},
+	},
+};
+
+/*
+ * Everything that follows the 7-byte endpoint prefix of the audio streaming
+ * endpoint. The PSP bus driver (6.61) stores only those 7 bytes inline; for a
+ * UAC 1.0 endpoint (bLength 9) bRefresh and bSynchAddress belong to the
+ * extension, followed by the class-specific audio endpoint descriptor (no
+ * controls). This is the layout the USB MIDI driver uses for its own
+ * 9-byte audio-class endpoints.
+ */
+struct __attribute__((packed)) audio_endpoint_extension_desc {
+	unsigned char bRefresh;
+	unsigned char bSynchAddress;
+	struct uac_cs_endpoint_descriptor cs;
+};
+
+static struct audio_endpoint_extension_desc audio_endpoint_extension = {
+	.bRefresh		= 0,
+	.bSynchAddress		= 0,
+	.cs = {
+		.bLength		= sizeof(struct uac_cs_endpoint_descriptor),
+		.bDescriptorType	= UAC_DT_CS_ENDPOINT,
+		.bDescriptorSubtype	= UAC_EP_GENERAL,
+		.bmAttributes		= 0,
+		.bLockDelayUnits	= 0,
+		.wLockDelay		= 0,
+	},
+};
+
+/* wTotalLength without the audio function */
+#define VIDEO_CONFIG_LENGTH \
+	(USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 1 * USB_DT_ENDPOINT_SIZE + \
+	 sizeof(interface_association_descriptor) + \
+	 sizeof(video_control_descriptors) + \
+	 sizeof(video_streaming_descriptors))
+
+/* Everything the audio function adds to wTotalLength */
+#define AUDIO_CONFIG_LENGTH \
+	(3 * USB_DT_INTERFACE_SIZE +			/* dummy, control, streaming alt 0 */ \
+	 1 * USB_DT_INTERFACE_SIZE +			/* streaming alt 1 */ \
+	 UAC_DT_ENDPOINT_AUDIO_SIZE +			/* iso endpoint (9 bytes) */ \
+	 sizeof(audio_interface_association_descriptor) + \
+	 sizeof(audio_control_descriptors) + \
+	 sizeof(audio_streaming_descriptors) + \
+	 sizeof(struct uac_cs_endpoint_descriptor))
+#else
+#define AUDIO_CONFIG_LENGTH	0
+#endif
+
+/*
+ * The bus driver reads its interface table as { up to two descriptors (the
+ * alternate settings), count }. Same 12 bytes as struct InterfaceSettings.
+ */
+struct psp_usb_interfaces {
+	struct InterfaceDescriptor *infp[2];
+	unsigned int num;
+};
+
 /* Endpoint blocks */
 static
-struct SceUdcdEndpoint endpoints[2] = {
+struct SceUdcdEndpoint endpoints[NUM_ENDPOINTS] __attribute__((aligned(16))) = {
 	{0, 0, 0},
 	{1, 0, 0},
+#if UVC_AUDIO
+	{2, 0, 0},
+#endif
 };
 
 /* Interface */
 static
-struct SceUdcdInterface interface = {
+struct SceUdcdInterface interface __attribute__((aligned(16))) = {
 	.expectNumber		= -1,
 	.interfaceNumber	= 0,
-	.numInterfaces		= 3
+	.numInterfaces		= NUM_INTERFACES
 };
 
 #if 0
@@ -183,7 +358,7 @@ struct SceUdcdStringDescriptor string_descriptor_serial = {
 
 /* Hi-Speed device descriptor */
 static
-struct SceUdcdDeviceDescriptor devdesc_hi = {
+struct SceUdcdDeviceDescriptor devdesc_hi __attribute__((aligned(16))) = {
 	USB_DT_DEVICE_SIZE,
 	USB_DT_DEVICE,
 	0x200,				/* bcdUSB */
@@ -202,7 +377,7 @@ struct SceUdcdDeviceDescriptor devdesc_hi = {
 
 /* Hi-Speed endpoint descriptors */
 static
-struct SceUdcdEndpointDescriptor endpdesc_hi[2] = {
+struct SceUdcdEndpointDescriptor endpdesc_hi[NUM_ENDPOINTS] __attribute__((aligned(16))) = {
 	/* Video Streaming endpoints */
 	{
 		USB_DT_ENDPOINT_SIZE,
@@ -212,6 +387,19 @@ struct SceUdcdEndpointDescriptor endpdesc_hi[2] = {
 		0x200,				/* wMaxPacketSize */
 		0x00				/* bInterval */
 	},
+#if UVC_AUDIO
+	/* Audio Streaming endpoint: isochronous IN, one packet per millisecond */
+	{
+		.bLength		= UAC_DT_ENDPOINT_AUDIO_SIZE,
+		.bDescriptorType	= USB_DT_ENDPOINT,
+		.bEndpointAddress	= USB_ENDPOINT_IN | UVC_AUDIO_EP,
+		.bmAttributes		= UAC_EP_ATTR_ISO_ASYNC,
+		.wMaxPacketSize		= AUDIO_EP_MAXPACKET,
+		.bInterval		= UVC_AUDIO_HS_INTERVAL,
+		.extra			= (unsigned char *)&audio_endpoint_extension,
+		.extraLength		= sizeof(audio_endpoint_extension),
+	},
+#endif
 	{
 		0,
 	}
@@ -219,7 +407,7 @@ struct SceUdcdEndpointDescriptor endpdesc_hi[2] = {
 
 /* Hi-Speed interface descriptor */
 static
-struct SceUdcdInterfaceDescriptor interdesc_hi[4] = {
+struct SceUdcdInterfaceDescriptor interdesc_hi[NUM_INTERFACES + (UVC_AUDIO ? 2 : 1)] __attribute__((aligned(16))) = {
 	{	/* Dummy interface just to include the IAD */
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
@@ -263,6 +451,64 @@ struct SceUdcdInterfaceDescriptor interdesc_hi[4] = {
 		(void *)&video_streaming_descriptors,
 		sizeof(video_streaming_descriptors)
 	},
+#if UVC_AUDIO
+	{	/* Dummy interface just to include the audio IAD */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_DUMMY_INTERFACE,		/* bInterfaceNumber */
+		0,				/* bAlternateSetting */
+		0,				/* bNumEndpoints */
+		USB_CLASS_VENDOR_SPEC,		/* bInterfaceClass */
+		0,				/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		NULL,				/* endpoints */
+		(void *)&audio_interface_association_descriptor,
+		sizeof(audio_interface_association_descriptor)
+	},
+	{	/* Standard Audio Control Interface Descriptor */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_CONTROL_INTERFACE,	/* bInterfaceNumber */
+		0,				/* bAlternateSetting */
+		0,				/* bNumEndpoints */
+		USB_CLASS_AUDIO,		/* bInterfaceClass */
+		UAC_SC_AUDIOCONTROL,		/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		NULL,				/* endpoints */
+		(void *)&audio_control_descriptors,
+		sizeof(audio_control_descriptors)
+	},
+	{	/* Audio Streaming Interface, alternate setting 0: no bandwidth */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE,		/* bInterfaceNumber */
+		0,				/* bAlternateSetting */
+		0,				/* bNumEndpoints */
+		USB_CLASS_AUDIO,		/* bInterfaceClass */
+		UAC_SC_AUDIOSTREAMING,		/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		NULL,				/* endpoints */
+		NULL,
+		0
+	},
+	{	/* Audio Streaming Interface, alternate setting 1: streaming */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE,		/* bInterfaceNumber */
+		AUDIO_ALT_STREAMING,		/* bAlternateSetting */
+		1,				/* bNumEndpoints */
+		USB_CLASS_AUDIO,		/* bInterfaceClass */
+		UAC_SC_AUDIOSTREAMING,		/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		&endpdesc_hi[1],		/* endpoints */
+		(void *)&audio_streaming_descriptors,
+		sizeof(audio_streaming_descriptors)
+	},
+#endif
 	{
 		0
 	}
@@ -270,41 +516,46 @@ struct SceUdcdInterfaceDescriptor interdesc_hi[4] = {
 
 /* Hi-Speed settings */
 static
-struct SceUdcdInterfaceSettings settings_hi[3] = {
-	{&interdesc_hi[0], 0, 1},
-	{&interdesc_hi[1], 0, 1},
-	{&interdesc_hi[2], 0, 1}
+struct psp_usb_interfaces settings_hi[NUM_INTERFACES] __attribute__((aligned(16))) = {
+	{{&interdesc_hi[0], NULL}, 1},
+	{{&interdesc_hi[1], NULL}, 1},
+	{{&interdesc_hi[2], NULL}, 1},
+#if UVC_AUDIO
+	{{&interdesc_hi[3], NULL}, 1},
+	{{&interdesc_hi[4], NULL}, 1},
+	/* streaming interface: alternate settings 0 and 1 are the contiguous
+	 * records interdesc[5] and [6]; the firmware steps from the first by one
+	 * record per alternate, so the second word stays 0 */
+	{{&interdesc_hi[5], NULL}, 2},
+#endif
 };
 
 /* Hi-Speed configuration descriptor */
 static
-struct SceUdcdConfigDescriptor confdesc_hi = {
+struct SceUdcdConfigDescriptor confdesc_hi __attribute__((aligned(16))) = {
 	USB_DT_CONFIG_SIZE,
 	USB_DT_CONFIG,
-	(USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 1 * USB_DT_ENDPOINT_SIZE +
-		sizeof(interface_association_descriptor) +
-		sizeof(video_control_descriptors) +
-		sizeof(video_streaming_descriptors)),	/* wTotalLength */
-	3,			/* bNumInterfaces */
+	(VIDEO_CONFIG_LENGTH + AUDIO_CONFIG_LENGTH),	/* wTotalLength */
+	NUM_INTERFACES,		/* bNumInterfaces */
 	1,			/* bConfigurationValue */
 	0,			/* iConfiguration */
 	0x80,			/* bmAttributes */
 	250,			/* bMaxPower */
-	&settings_hi[0]
+	(struct SceUdcdInterfaceSettings *)&settings_hi[0]
 };
 
 /* Hi-Speed configuration */
 static
-struct SceUdcdConfiguration config_hi = {
+struct SceUdcdConfiguration config_hi __attribute__((aligned(16))) = {
 	&confdesc_hi,
-	&settings_hi[0],
+	(struct SceUdcdInterfaceSettings *)&settings_hi[0],
 	&interdesc_hi[0],
 	&endpdesc_hi[0]
 };
 
 /* Full-Speed device descriptor */
 static
-struct SceUdcdDeviceDescriptor devdesc_full = {
+struct SceUdcdDeviceDescriptor devdesc_full __attribute__((aligned(16))) = {
 	USB_DT_DEVICE_SIZE,
 	USB_DT_DEVICE,
 	0x200,				/* bcdUSB */
@@ -323,7 +574,7 @@ struct SceUdcdDeviceDescriptor devdesc_full = {
 
 /* Full-Speed endpoint descriptors */
 static
-struct SceUdcdEndpointDescriptor endpdesc_full[2] = {
+struct SceUdcdEndpointDescriptor endpdesc_full[NUM_ENDPOINTS] __attribute__((aligned(16))) = {
 	/* Video Streaming endpoints */
 	{
 		USB_DT_ENDPOINT_SIZE,
@@ -333,6 +584,19 @@ struct SceUdcdEndpointDescriptor endpdesc_full[2] = {
 		0x40,				/* wMaxPacketSize */
 		0x00				/* bInterval */
 	},
+#if UVC_AUDIO
+	/* Audio Streaming endpoint: isochronous IN, one packet per millisecond */
+	{
+		.bLength		= UAC_DT_ENDPOINT_AUDIO_SIZE,
+		.bDescriptorType	= USB_DT_ENDPOINT,
+		.bEndpointAddress	= USB_ENDPOINT_IN | UVC_AUDIO_EP,
+		.bmAttributes		= UAC_EP_ATTR_ISO_ASYNC,
+		.wMaxPacketSize		= AUDIO_EP_MAXPACKET,
+		.bInterval		= 1,
+		.extra			= (unsigned char *)&audio_endpoint_extension,
+		.extraLength		= sizeof(audio_endpoint_extension),
+	},
+#endif
 	{
 		0,
 	}
@@ -340,7 +604,7 @@ struct SceUdcdEndpointDescriptor endpdesc_full[2] = {
 
 /* Full-Speed interface descriptor */
 static
-struct SceUdcdInterfaceDescriptor interdesc_full[4] = {
+struct SceUdcdInterfaceDescriptor interdesc_full[NUM_INTERFACES + (UVC_AUDIO ? 2 : 1)] __attribute__((aligned(16))) = {
 	{	/* Dummy interface just to include the IAD */
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
@@ -384,6 +648,64 @@ struct SceUdcdInterfaceDescriptor interdesc_full[4] = {
 		(void *)&video_streaming_descriptors,
 		sizeof(video_streaming_descriptors)
 	},
+#if UVC_AUDIO
+	{	/* Dummy interface just to include the audio IAD */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_DUMMY_INTERFACE,		/* bInterfaceNumber */
+		0,				/* bAlternateSetting */
+		0,				/* bNumEndpoints */
+		USB_CLASS_VENDOR_SPEC,		/* bInterfaceClass */
+		0,				/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		NULL,				/* endpoints */
+		(void *)&audio_interface_association_descriptor,
+		sizeof(audio_interface_association_descriptor)
+	},
+	{	/* Standard Audio Control Interface Descriptor */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_CONTROL_INTERFACE,	/* bInterfaceNumber */
+		0,				/* bAlternateSetting */
+		0,				/* bNumEndpoints */
+		USB_CLASS_AUDIO,		/* bInterfaceClass */
+		UAC_SC_AUDIOCONTROL,		/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		NULL,				/* endpoints */
+		(void *)&audio_control_descriptors,
+		sizeof(audio_control_descriptors)
+	},
+	{	/* Audio Streaming Interface, alternate setting 0: no bandwidth */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE,		/* bInterfaceNumber */
+		0,				/* bAlternateSetting */
+		0,				/* bNumEndpoints */
+		USB_CLASS_AUDIO,		/* bInterfaceClass */
+		UAC_SC_AUDIOSTREAMING,		/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		NULL,				/* endpoints */
+		NULL,
+		0
+	},
+	{	/* Audio Streaming Interface, alternate setting 1: streaming */
+		USB_DT_INTERFACE_SIZE,
+		USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE,		/* bInterfaceNumber */
+		AUDIO_ALT_STREAMING,		/* bAlternateSetting */
+		1,				/* bNumEndpoints */
+		USB_CLASS_AUDIO,		/* bInterfaceClass */
+		UAC_SC_AUDIOSTREAMING,		/* bInterfaceSubClass */
+		0,				/* bInterfaceProtocol */
+		0,				/* iInterface */
+		&endpdesc_full[1],		/* endpoints */
+		(void *)&audio_streaming_descriptors,
+		sizeof(audio_streaming_descriptors)
+	},
+#endif
 	{
 		0
 	}
@@ -391,34 +713,68 @@ struct SceUdcdInterfaceDescriptor interdesc_full[4] = {
 
 /* Full-Speed settings */
 static
-struct SceUdcdInterfaceSettings settings_full[3] = {
-	{&interdesc_full[0], 0, 1},
-	{&interdesc_full[1], 0, 1},
-	{&interdesc_full[2], 0, 1}
+struct psp_usb_interfaces settings_full[NUM_INTERFACES] __attribute__((aligned(16))) = {
+	{{&interdesc_full[0], NULL}, 1},
+	{{&interdesc_full[1], NULL}, 1},
+	{{&interdesc_full[2], NULL}, 1},
+#if UVC_AUDIO
+	{{&interdesc_full[3], NULL}, 1},
+	{{&interdesc_full[4], NULL}, 1},
+	/* streaming interface: alternate settings 0 and 1 are the contiguous
+	 * records interdesc[5] and [6]; the firmware steps from the first by one
+	 * record per alternate, so the second word stays 0 */
+	{{&interdesc_full[5], NULL}, 2},
+#endif
 };
 
 /* Full-Speed configuration descriptor */
 static
-struct SceUdcdConfigDescriptor confdesc_full = {
+struct SceUdcdConfigDescriptor confdesc_full __attribute__((aligned(16))) = {
 	USB_DT_CONFIG_SIZE,
 	USB_DT_CONFIG,
-	(USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 1 * USB_DT_ENDPOINT_SIZE +
-		sizeof(interface_association_descriptor) +
-		sizeof(video_control_descriptors) +
-		sizeof(video_streaming_descriptors)),	/* wTotalLength */
-	3,			/* bNumInterfaces */
+	(VIDEO_CONFIG_LENGTH + AUDIO_CONFIG_LENGTH),	/* wTotalLength */
+	NUM_INTERFACES,		/* bNumInterfaces */
 	1,			/* bConfigurationValue */
 	0,			/* iConfiguration */
 	0x80,			/* bmAttributes */
 	250,			/* bMaxPower */
-	&settings_full[0]
+	(struct SceUdcdInterfaceSettings *)&settings_full[0]
 };
 
 /* Full-Speed configuration */
 static
-struct SceUdcdConfiguration config_full = {
+struct SceUdcdConfiguration config_full __attribute__((aligned(16))) = {
 	&confdesc_full,
-	&settings_full[0],
+	(struct SceUdcdInterfaceSettings *)&settings_full[0],
 	&interdesc_full[0],
 	&endpdesc_full[0]
 };
+
+#if UVC_AUDIO
+/*
+ * If the host refuses the full configuration, main() re-registers the driver
+ * with a smaller one. Level 1 drops the class-specific audio endpoint
+ * descriptor (the only descriptor that hangs off an endpoint); level 2 drops
+ * the audio function altogether, which is exactly the video-only device.
+ */
+static void uvc_descriptors_degrade(int level)
+{
+	if (level == 1) {
+		/* keep bRefresh/bSynchAddress (the endpoint stays 9 bytes), drop the rest */
+		endpdesc_hi[1].extraLength = 2;
+		endpdesc_full[1].extraLength = 2;
+		confdesc_hi.wTotalLength -= sizeof(struct uac_cs_endpoint_descriptor);
+		confdesc_full.wTotalLength -= sizeof(struct uac_cs_endpoint_descriptor);
+	} else if (level >= 2) {
+		memset(&interdesc_hi[3], 0, sizeof(interdesc_hi[3]));
+		memset(&interdesc_full[3], 0, sizeof(interdesc_full[3]));
+		memset(&endpdesc_hi[1], 0, sizeof(endpdesc_hi[1]));
+		memset(&endpdesc_full[1], 0, sizeof(endpdesc_full[1]));
+		confdesc_hi.wTotalLength = VIDEO_CONFIG_LENGTH;
+		confdesc_full.wTotalLength = VIDEO_CONFIG_LENGTH;
+		confdesc_hi.bNumInterfaces = 3;
+		confdesc_full.bNumInterfaces = 3;
+		interface.numInterfaces = 3;
+	}
+}
+#endif
